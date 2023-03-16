@@ -1,0 +1,589 @@
+package mls
+
+import (
+	"math/rand"
+	"testing"
+	"time"
+	//	"sort"
+	//	"fmt"
+	//	"github.com/cisco/go-tls-syntax"
+)
+
+// Note that we had to change the headersize of ParentHash to 2 for |G| > 16 to work!
+
+type StateBench struct {
+	initSecrets   [][]byte
+	identityPrivs []SignaturePrivateKey
+	credentials   []Credential
+	initPrivs     []HPKEPrivateKey
+	keyPackages   []KeyPackage
+	states        []State
+}
+
+func setupBench(groupSize int) StateBench {
+	stateBench := StateBench{}
+	stateBench.keyPackages = make([]KeyPackage, groupSize)
+	scheme := suite.Scheme()
+
+	for i := 0; i < groupSize; i++ {
+		// cred gen
+		secret := randomBytes(32)
+		sigPriv, err := scheme.Derive(secret)
+		if err != nil {
+			panic(err)
+		}
+
+		cred := NewBasicCredential(userID, scheme, sigPriv.PublicKey)
+
+		//kp gen
+		kp, err := NewKeyPackageWithSecret(suite, secret, cred, sigPriv)
+		if err != nil {
+			panic(err)
+		}
+
+		// save all the materials
+		stateBench.initSecrets = append(stateBench.initSecrets, secret)
+		stateBench.identityPrivs = append(stateBench.identityPrivs, sigPriv)
+		stateBench.credentials = append(stateBench.credentials, *cred)
+		stateBench.keyPackages[i] = *kp
+	}
+	return stateBench
+}
+
+func setupGroupBench(groupSize int) StateBench {
+	stateBench := setupBench(groupSize)
+	var states []State
+	// start with the group creator
+	s0, err := NewEmptyState(groupID, stateBench.initSecrets[0], stateBench.identityPrivs[0], stateBench.keyPackages[0])
+	states = append(states, *s0)
+
+	// add proposals for rest of the participants
+	for i := 1; i < groupSize; i++ {
+		add, err := states[0].Add(stateBench.keyPackages[i])
+		if err != nil {
+			panic(err)
+		}
+		_, err = states[0].Handle(add)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	// commit the adds
+	secret := randomBytes(32)
+	_, welcome, next, err := states[0].Commit(secret)
+	if err != nil {
+		panic(err)
+	}
+	states[0] = *next
+	// initialize the new joiners from the welcome
+	for i := 1; i < groupSize; i++ {
+		s, err := NewJoinedState(stateBench.initSecrets[i], stateBench.identityPrivs[i:i+1], stateBench.keyPackages[i:i+1], *welcome)
+		if err != nil {
+			panic(err)
+		}
+		states = append(states, *s)
+	}
+
+	stateBench.states = states
+
+	return stateBench
+}
+
+func randomSet(groupSize int) []int {
+	a := make([]int, groupSize)
+	for i := range a {
+		tmp := i
+		a[i] = tmp
+	}
+	rand.Seed(time.Now().UnixNano())
+	rand.Shuffle(len(a), func(i, j int) { a[i], a[j] = a[j], a[i] })
+	return a
+}
+
+func benchmarkVaryGroupsCommitTime(b *testing.B, G int, normalUpdates bool) {
+	b.StopTimer()
+	normalUpdaters := G / 4
+	stateBench := setupGroupBench(G)
+	states := stateBench.states
+	normalupdates := make([]*MLSPlaintext, normalUpdaters)
+
+	var updaters []int
+	if !normalUpdates {
+		normalUpdaters = 0
+	} else {
+		updaters = randomSet(G)[:normalUpdaters]
+	}
+
+	for i := 0; i < normalUpdaters; i++ {
+		index := updaters[i]
+
+		oldCred := stateBench.keyPackages[index].Credential
+
+		newSecret := randomBytes(32)
+		newInitKey, err := suite.hpke().Derive(newSecret)
+
+		if err != nil {
+			panic(err)
+		}
+
+		newKP, err := NewKeyPackageWithInitKey(suite, newInitKey.PublicKey, &oldCred, stateBench.identityPrivs[index])
+		if err != nil {
+			panic(err)
+		}
+
+		normalupdates[i], err = states[index].Update(newSecret, &stateBench.identityPrivs[index], *newKP)
+		if err != nil {
+			panic(err)
+		}
+
+	}
+
+	state := states[0]
+
+	// Message sizes:
+	/*
+		for j := 0; j < normalUpdaters; j++ {
+			fmt.Println(len(normalupdates[j].toBeSigned(states[0].groupContext())))
+		}
+	*/
+
+	b.StartTimer()
+	for i := 0; i < b.N; i++ {
+		ind := rand.Intn(G)
+		state = states[ind]
+
+		/*
+
+			for j := 0; j < adminUpdaters; j++ {
+				_, err := state.Handle(adminupdates[j])
+				if err != nil {
+					panic(err)
+				}
+			}
+		*/
+
+		for j := 0; j < normalUpdaters; j++ {
+			_, err := state.Handle(normalupdates[j])
+			if err != nil {
+				panic(err)
+			}
+		}
+
+		secret := randomBytes(32)
+		_, _, _, err := state.Commit(secret)
+		if err != nil {
+			panic(err)
+		}
+	}
+}
+
+func BenchmarkVaryGroupsCommitTime8_F(b *testing.B) {
+	benchmarkVaryGroupsCommitTime(b, 8, false)
+}
+
+func BenchmarkVaryGroupsCommitTime8_T(b *testing.B) {
+	benchmarkVaryGroupsCommitTime(b, 8, true)
+}
+
+func BenchmarkVaryGroupsCommitTime16_F(b *testing.B) {
+	benchmarkVaryGroupsCommitTime(b, 16, false)
+}
+
+func BenchmarkVaryGroupsCommitTime16_T(b *testing.B) {
+	benchmarkVaryGroupsCommitTime(b, 16, true)
+}
+
+func BenchmarkVaryGroupsCommitTime32_F(b *testing.B) {
+	benchmarkVaryGroupsCommitTime(b, 32, false)
+}
+
+func BenchmarkVaryGroupsCommitTime32_T(b *testing.B) {
+	benchmarkVaryGroupsCommitTime(b, 32, true)
+}
+
+func BenchmarkVaryGroupsCommitTime64_F(b *testing.B) {
+	benchmarkVaryGroupsCommitTime(b, 64, false)
+}
+
+func BenchmarkVaryGroupsCommitTime64_T(b *testing.B) {
+	benchmarkVaryGroupsCommitTime(b, 64, true)
+}
+
+func BenchmarkVaryGroupsCommitTime128_F(b *testing.B) {
+	benchmarkVaryGroupsCommitTime(b, 128, false)
+}
+
+func BenchmarkVaryGroupsCommitTime128_T(b *testing.B) {
+	benchmarkVaryGroupsCommitTime(b, 128, true)
+}
+
+func benchmarkFixedGroupsCommitTime(b *testing.B, upd int) {
+	b.StopTimer()
+	G := 64
+	//	Gstar := 16
+	//	adminUpdaters := adminupd
+	normalUpdaters := upd
+	stateBench := setupGroupBench(G)
+	//	fmt.Println(admins)
+	//	admins = admins[:Gstar]
+	states := stateBench.states
+	//	adminupdates := make([]*MLSPlaintext, adminUpdaters)
+	normalupdates := make([]*MLSPlaintext, normalUpdaters)
+
+	var updaters []int
+	if upd > 0 {
+		updaters = randomSet(G)[:normalUpdaters]
+	}
+
+	for i := 0; i < normalUpdaters; i++ {
+		index := updaters[i]
+		oldCred := stateBench.keyPackages[index].Credential
+
+		newSecret := randomBytes(32)
+		newInitKey, err := suite.hpke().Derive(newSecret)
+
+		if err != nil {
+			panic(err)
+		}
+
+		newKP, err := NewKeyPackageWithInitKey(suite, newInitKey.PublicKey, &oldCred, stateBench.identityPrivs[index])
+		if err != nil {
+			panic(err)
+		}
+
+		normalupdates[i], err = states[index].Update(newSecret, &stateBench.identityPrivs[index], *newKP)
+		if err != nil {
+			panic(err)
+		}
+
+	}
+
+	state := states[0]
+	b.StartTimer()
+	for i := 0; i < b.N; i++ {
+		ind := rand.Intn(G)
+		state = states[ind]
+
+		for j := 0; j < normalUpdaters; j++ {
+			_, err := state.Handle(normalupdates[j])
+			if err != nil {
+				panic(err)
+			}
+		}
+
+		secret := randomBytes(32)
+		_, _, _, err := state.Commit(secret)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+}
+
+func BenchmarkFixedGroupsCommitTime_0(b *testing.B) {
+	benchmarkFixedGroupsCommitTime(b, 0)
+}
+
+func BenchmarkFixedGroupsCommitTime_4(b *testing.B) {
+	benchmarkFixedGroupsCommitTime(b, 4)
+}
+
+func BenchmarkFixedGroupsCommitTime_8(b *testing.B) {
+	benchmarkFixedGroupsCommitTime(b, 8)
+}
+
+func BenchmarkFixedGroupsCommitTime_12(b *testing.B) {
+	benchmarkFixedGroupsCommitTime(b, 12)
+}
+
+func BenchmarkFixedGroupsCommitTime_16(b *testing.B) {
+	benchmarkFixedGroupsCommitTime(b, 16)
+}
+
+func BenchmarkFixedGroupsCommitTime_20(b *testing.B) {
+	benchmarkFixedGroupsCommitTime(b, 20)
+}
+
+func BenchmarkFixedGroupsCommitTime_24(b *testing.B) {
+	benchmarkFixedGroupsCommitTime(b, 24)
+}
+
+func BenchmarkFixedGroupsCommitTime_28(b *testing.B) {
+	benchmarkFixedGroupsCommitTime(b, 28)
+}
+
+func BenchmarkFixedGroupsCommitTime_32(b *testing.B) {
+	benchmarkFixedGroupsCommitTime(b, 32)
+}
+
+func randomSetWithout(groupSize int, index int) []int {
+	k := 0
+	a := make([]int, groupSize-1)
+	for i := 0; i < groupSize; i++ {
+		if i != index {
+			tmp := i
+			a[k] = tmp
+			k++
+		}
+	}
+	rand.Seed(time.Now().UnixNano())
+	rand.Shuffle(len(a), func(i, j int) { a[i], a[j] = a[j], a[i] })
+	return a
+}
+
+func benchmarkVaryGroupsProcessTime(b *testing.B, G int, normalUpdates bool) {
+	b.StopTimer()
+	//	adminUpdaters := G/8
+	normalUpdaters := G / 4
+	stateBench := setupGroupBench(G)
+	//	fmt.Println(admins)
+	//	admins = admins[:Gstar]
+	states := stateBench.states
+	//	adminupdates := make([]*MLSPlaintext, adminUpdaters)
+	normalupdates := make([]*MLSPlaintext, normalUpdaters)
+
+	var updaters []int
+	if !normalUpdates {
+		normalUpdaters = 0
+	} else {
+		updaters = randomSet(G)[:normalUpdaters]
+	}
+
+	for i := 0; i < normalUpdaters; i++ {
+		index := updaters[i]
+		oldCred := stateBench.keyPackages[index].Credential
+
+		newSecret := randomBytes(32)
+		newInitKey, err := suite.hpke().Derive(newSecret)
+
+		if err != nil {
+			panic(err)
+		}
+
+		newKP, err := NewKeyPackageWithInitKey(suite, newInitKey.PublicKey, &oldCred, stateBench.identityPrivs[index])
+		if err != nil {
+			panic(err)
+		}
+
+		normalupdates[i], err = states[index].Update(newSecret, &stateBench.identityPrivs[index], *newKP)
+		if err != nil {
+			panic(err)
+		}
+
+	}
+
+	ind := rand.Intn(G)
+	state := states[ind]
+
+	for j := 0; j < normalUpdaters; j++ {
+		_, err := state.Handle(normalupdates[j])
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	secret := randomBytes(32)
+	com, _, _, err := state.Commit(secret)
+	if err != nil {
+		panic(err)
+	}
+
+	// Message sizes:
+	// fmt.Println("com", normalUpdates, G, len(com.toBeSigned(state.groupContext())))
+
+	noncommitters := randomSetWithout(G, ind)
+
+	b.StartTimer()
+	for i := 0; i < b.N; i++ {
+		ind := rand.Intn(len(noncommitters))
+		state = states[noncommitters[ind]]
+
+		for j := 0; j < normalUpdaters; j++ {
+			_, err := state.Handle(normalupdates[j])
+			if err != nil {
+				panic(err)
+			}
+		}
+
+		_, _ = state.Handle(com)
+	}
+
+}
+
+func BenchmarkVaryGroupsProcessTime8_F(b *testing.B) {
+	benchmarkVaryGroupsProcessTime(b, 8, false)
+}
+
+func BenchmarkVaryGroupsProcessTime8_T(b *testing.B) {
+	benchmarkVaryGroupsProcessTime(b, 8, true)
+}
+
+func BenchmarkVaryGroupsProcessTime16_F(b *testing.B) {
+	benchmarkVaryGroupsProcessTime(b, 16, false)
+}
+
+func BenchmarkVaryGroupsProcessTime16_T(b *testing.B) {
+	benchmarkVaryGroupsProcessTime(b, 16, true)
+}
+
+func BenchmarkVaryGroupsProcessTime32_F(b *testing.B) {
+	benchmarkVaryGroupsProcessTime(b, 32, false)
+}
+
+func BenchmarkVaryGroupsProcessTime32_T(b *testing.B) {
+	benchmarkVaryGroupsProcessTime(b, 32, true)
+}
+
+func BenchmarkVaryGroupsProcessTime64_F(b *testing.B) {
+	benchmarkVaryGroupsProcessTime(b, 64, false)
+}
+
+func BenchmarkVaryGroupsProcessTime64_T(b *testing.B) {
+	benchmarkVaryGroupsProcessTime(b, 64, true)
+}
+
+func BenchmarkVaryGroupsProcessTime128_F(b *testing.B) {
+	benchmarkVaryGroupsProcessTime(b, 128, false)
+}
+
+func BenchmarkVaryGroupsProcessTime128_T(b *testing.B) {
+	benchmarkVaryGroupsProcessTime(b, 128, true)
+}
+
+func benchmarkFixedGroupsProcessTime(b *testing.B, upd int) {
+	b.StopTimer()
+	G := 64
+	normalUpdaters := upd
+	stateBench := setupGroupBench(G)
+	//	fmt.Println(admins)
+	states := stateBench.states
+	normalupdates := make([]*MLSPlaintext, normalUpdaters)
+
+	var updaters []int
+	if upd > 0 {
+		updaters = randomSet(G)[:normalUpdaters]
+	}
+
+	for i := 0; i < normalUpdaters; i++ {
+		index := updaters[i]
+		/*
+			oldCred := stateBench.keyPackages[index].Credential
+			newPriv, _ := oldCred.Scheme().Generate()
+			newCred := NewBasicCredential(oldCred.Identity(), oldCred.Scheme(), newPriv.PublicKey)
+
+			newSecret := randomBytes(32)
+			newInitKey, err := suite.hpke().Derive(newSecret)
+			if err != nil {
+				panic(err)
+			}
+
+			newKP, err := NewKeyPackageWithInitKey(suite, newInitKey.PublicKey, newCred, newPriv)
+
+			updateSecret := randomBytes(32)
+			normalupdates[i], err = states[index].Update(updateSecret, &newPriv, *newKP)
+
+		*/
+		oldCred := stateBench.keyPackages[index].Credential
+
+		newSecret := randomBytes(32)
+		newInitKey, err := suite.hpke().Derive(newSecret)
+
+		if err != nil {
+			panic(err)
+		}
+
+		newKP, err := NewKeyPackageWithInitKey(suite, newInitKey.PublicKey, &oldCred, stateBench.identityPrivs[index])
+		if err != nil {
+			panic(err)
+		}
+
+		normalupdates[i], err = states[index].Update(newSecret, &stateBench.identityPrivs[index], *newKP)
+		if err != nil {
+			panic(err)
+		}
+		// can maybe comment out
+		/*
+			_, err = states[i].Handle(normalupdates[i])
+			if err != nil {
+				panic(err)
+			}
+		*/
+	}
+
+	ind := rand.Intn(G)
+	state := states[ind]
+
+	for j := 0; j < normalUpdaters; j++ {
+		_, err := state.Handle(normalupdates[j])
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	secret := randomBytes(32)
+	com, _, _, err := state.Commit(secret)
+	if err != nil {
+		panic(err)
+	}
+
+	noncommitters := randomSetWithout(G, ind)
+
+	//	for j := 0; j < normalUpdaters; j++ {
+	//		fmt.Println("prop", len(normalupdates[j].toBeSigned(state.groupContext())))
+	//	}
+
+	// Message sizes
+	// fmt.Println("com", upd, G, len(com.toBeSigned(state.groupContext())))
+
+	b.StartTimer()
+	for i := 0; i < b.N; i++ {
+		ind := rand.Intn(len(noncommitters))
+		state = states[noncommitters[ind]]
+
+		for j := 0; j < normalUpdaters; j++ {
+			_, err := state.Handle(normalupdates[j])
+			if err != nil {
+				panic(err)
+			}
+		}
+
+		_, _ = state.Handle(com)
+	}
+}
+
+func BenchmarkFixedGroupsProcessTime_0(b *testing.B) {
+	benchmarkFixedGroupsProcessTime(b, 0)
+}
+
+func BenchmarkFixedGroupsProcessTime_4(b *testing.B) {
+	benchmarkFixedGroupsProcessTime(b, 4)
+}
+
+func BenchmarkFixedGroupsProcessTime_8(b *testing.B) {
+	benchmarkFixedGroupsProcessTime(b, 8)
+}
+
+func BenchmarkFixedGroupsProcessTime_12(b *testing.B) {
+	benchmarkFixedGroupsProcessTime(b, 12)
+}
+
+func BenchmarkFixedGroupsProcessTime_16(b *testing.B) {
+	benchmarkFixedGroupsProcessTime(b, 16)
+}
+
+func BenchmarkFixedGroupsProcessTime_20(b *testing.B) {
+	benchmarkFixedGroupsProcessTime(b, 20)
+}
+
+func BenchmarkFixedGroupsProcessTime_24(b *testing.B) {
+	benchmarkFixedGroupsProcessTime(b, 24)
+}
+
+func BenchmarkFixedGroupsProcessTime_28(b *testing.B) {
+	benchmarkFixedGroupsProcessTime(b, 28)
+}
+
+func BenchmarkFixedGroupsProcessTime_32(b *testing.B) {
+	benchmarkFixedGroupsProcessTime(b, 32)
+}
